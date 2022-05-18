@@ -13,9 +13,110 @@
 
 // Protocol-specific functions for extracting requests and responses
 
+region_t* extract_requests_mqtt(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref) 
+{
+  char *mem;
+  unsigned int byte_count = 0;
+  unsigned int mem_count = 0;
+  unsigned int mem_size = 1024;
+  unsigned int region_count = 0;
+  region_t *regions = NULL;
+
+  unsigned int cur_start = 0;
+  unsigned int cur_end = 0;
+  unsigned int remaining_length = 0;
+
+  mem=(char *)ck_alloc(mem_size);
+
+  while (byte_count < buf_size) {
+    memcpy(&mem[mem_count], buf + byte_count++, 1);
+
+    // control byte read, parse remaining length
+    if ( mem_count > 0 ) {
+
+      // continuation bit is set, read more bits into remaining length
+      if (mem[mem_count] & 0x80) {
+        // byte 1-4 encode remaining length, byte 4 should not have continuation bit set.
+        if (mem_count >= 4) {
+          break; 
+        }
+        // least significant 7 bits encode remaining length 
+        remaining_length |= (mem[mem_count] & 0x7F) << (7 * (mem_count - 1));
+      } else {
+        // least significant 7 bits encode remaining length 
+        remaining_length |= (mem[mem_count] & 0x7F) << (7 * (mem_count - 1));
+
+        // skip variable header + payload
+        unsigned int bytes_to_skip = remaining_length;
+
+        unsigned int temp_count = 0;
+        while ((byte_count < buf_size) && (temp_count < bytes_to_skip)) {
+          byte_count++;
+          cur_end++;
+          temp_count++;
+        }
+
+        //Create one region
+        region_count++;
+        regions = (region_t *)ck_realloc(regions, region_count * sizeof(region_t));
+        regions[region_count - 1].start_byte = cur_start;
+        regions[region_count - 1].end_byte = cur_end;
+        regions[region_count - 1].state_sequence = NULL;
+        regions[region_count - 1].state_count = 0;
+
+        //Check if the last byte has been reached
+        if (cur_end < buf_size - 1) {
+          mem_count = 0;
+          remaining_length = 0;
+          cur_start = cur_end + 1;
+          cur_end = cur_start;
+          continue; // start with next region
+        }
+      }
+    }
+
+    // not done parsing remaining length, read more bytes
+    mem_count++;
+    cur_end++;
+
+    //Check if the last byte has been reached
+    if (cur_end == buf_size - 1) {
+      region_count++;
+      regions = (region_t *)ck_realloc(regions, region_count * sizeof(region_t));
+      regions[region_count - 1].start_byte = cur_start;
+      regions[region_count - 1].end_byte = cur_end;
+      regions[region_count - 1].state_sequence = NULL;
+      regions[region_count - 1].state_count = 0;
+      break;
+    }
+
+    if (mem_count == mem_size) {
+      //enlarge the mem buffer
+      mem_size = mem_size * 2;
+      mem=(char *)ck_realloc(mem, mem_size);
+    }
+  }
+
+  if (mem) ck_free(mem);
+
+  //in case region_count equals zero, it means that the structure of the buffer is broken
+  //hence we create one region for the whole buffer
+  if ((region_count == 0) && (buf_size > 0)) {
+    regions = (region_t *)ck_realloc(regions, sizeof(region_t));
+    regions[0].start_byte = 0;
+    regions[0].end_byte = buf_size - 1;
+    regions[0].state_sequence = NULL;
+    regions[0].state_count = 0;
+    region_count = 1;
+  }
+
+  *region_count_ref = region_count;
+  return regions;
+}
+
 region_t* extract_requests_smtp(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref)
 {
-   char *mem;
+  char *mem;
   unsigned int byte_count = 0;
   unsigned int mem_count = 0;
   unsigned int mem_size = 1024;
@@ -794,6 +895,83 @@ region_t* extract_requests_ipp(unsigned char* buf, unsigned int buf_size, unsign
 
   *region_count_ref = region_count;
   return regions;
+}
+
+unsigned int* extract_response_codes_mqtt(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
+{
+  char *mem;
+  unsigned int byte_count = 0;
+  unsigned int mem_count = 0;
+  unsigned int mem_size = 1024;
+  unsigned int *state_sequence = NULL;
+  unsigned int state_count = 0;
+
+  unsigned int remaining_length = 0;
+
+  mem=(char *)ck_alloc(mem_size);
+
+  //Add initial state
+  state_count++;
+  state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+  state_sequence[state_count - 1] = 0;
+
+  while (byte_count < buf_size) {
+
+    memcpy(&mem[mem_count], buf + byte_count++, 1);
+
+    // parsing remaining length
+    if ( mem_count > 0 ) {
+
+      // continuation bit is set, read more bits into remaining length
+      if (mem[mem_count] & 0x80) {
+        // byte 1-4 encode remaining length, byte 4 should not have continuation bit set.
+        if (mem_count >= 4) {
+          break;
+        }
+        // least significant 7 bits encode remaining length 
+        remaining_length |= (mem[mem_count] & 0x7F) << (7 * (mem_count - 1));
+
+      // no continuation bit, we can decode remaining length
+      } else {
+        // least significant 7 bits encode remaining length 
+        remaining_length |= (mem[mem_count] & 0x7F) << (7 * (mem_count - 1));
+
+        // skip variable header + payload
+        unsigned int bytes_to_skip = remaining_length;
+
+        unsigned int temp_count = 0;
+        while ((byte_count < buf_size) && (temp_count < bytes_to_skip)) {
+        byte_count++;
+        temp_count++;
+        }
+
+        /* NOTE: The MQTT control byte is not a status code. */
+        /* Most message types have dedicated ACK message type as server response. */
+        /* Therefore, control byte comes close to status code. */
+        /* However, some messages are not acknowledged... */
+
+        //add a new response code
+        unsigned int message_code = (unsigned int)mem[0]; // take byte 0 (control) as status code.
+        state_count++;
+        state_sequence = (unsigned int *)ck_realloc(state_sequence, state_count * sizeof(unsigned int));
+        state_sequence[state_count - 1] = message_code;
+        mem_count = 0;
+        remaining_length = 0;
+        continue;
+      }
+    }
+    mem_count++; 
+
+    if (mem_count == mem_size) {
+      //enlarge the mem buffer
+      mem_size = mem_size * 2;
+      mem=(char *)ck_realloc(mem, mem_size);
+    }
+  }
+  if (mem) ck_free(mem);
+
+  *state_count_ref = state_count;
+  return state_sequence;
 }
 
 unsigned int* extract_response_codes_smtp(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref)
